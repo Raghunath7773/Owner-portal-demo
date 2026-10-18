@@ -8,16 +8,17 @@ export const TOOL_DECLARATIONS = [
   {
     name: 'get_income_summary',
     description:
-      "The owner's income per month = their settlement payouts, exactly as shown in Owner Financials, with each settlement. " +
-      'Pass several months to compare them (e.g. this month and last month).',
+      "The owner's money per month exactly as the Owner Financials ledger: settlement payouts plus other income, minus " +
+      'expenses and payments (net_total), with every settlement and entry. Pass several months to compare them.',
     behavior: Behavior.NON_BLOCKING,
     parameters: { type: Type.OBJECT, properties: { months: { type: Type.ARRAY, items: MONTH } }, required: ['months'] },
   },
   {
     name: 'get_month_breakdown',
     description:
-      'Full breakdown of ONE month in a single call: every settlement that month with its payout, fee and line items ' +
-      '(reservations/units, dates, amounts). Use for "break down my September income/statement".',
+      'Full breakdown of ONE month in a single call: every settlement with its payout, fee and line items ' +
+      '(reservations/units, dates, amounts), plus the expenses, payments and other income entries, and net_total. ' +
+      'Use for "break down my September income/statement".',
     behavior: Behavior.NON_BLOCKING,
     parameters: { type: Type.OBJECT, properties: { month: MONTH }, required: ['month'] },
   },
@@ -118,6 +119,48 @@ async function listSettlements(ctx, from, to) {
     .sort((a, b) => String(a.date).localeCompare(String(b.date)));
 }
 
+/** Owner Financials ledger rule for manual entries (calculations.ts): income is a credit, expense and payment are debits. */
+export function manualEntry(e) {
+  const amount = round2(Math.abs(Number(e.ownerAmt) || 0));
+  const kind = e.type === 1 ? 'income' : e.type === 2 ? 'expense' : 'payment';
+  return { kind, amount: kind === 'income' ? amount : -amount };
+}
+
+/** Manual income/expense/payment entries on the owner's units — the ledger's second source next to settlements. */
+async function listManualEntries(ctx, from, to) {
+  const units = await Promise.all(
+    ctx.unitIds.map((uid) =>
+      // Same request and the same "skip a unit that fails" behaviour as the ledger.
+      erpGet(`/data-import/units/${uid}?startDate=${from}&endDate=${to}`).then((r) => r?.data ?? r).catch(() => null),
+    ),
+  );
+  return units
+    .flatMap((u) =>
+      (u?.entries ?? [])
+        .filter((e) => e.source === 'manual' && e.status === 'active')
+        .map((e) => ({ entry_id: e.id, date: e.date, unit: u.unit_name, ...manualEntry(e), details: e.details || undefined })),
+    )
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+}
+
+/** One month as the ledger shows it: settlements plus manual entries, and the net change. */
+export function monthTotals(month, settlements, entries) {
+  const s = settlements.filter((x) => String(x.date).startsWith(month));
+  const e = entries.filter((x) => String(x.date).startsWith(month));
+  const sum = (values) => round2(values.reduce((a, v) => a + v, 0));
+  const totals = {
+    settlement_income: sum(s.map((x) => x.owner_payout).filter((v) => v > 0)),
+    settlement_debits: sum(s.map((x) => -x.owner_payout).filter((v) => v > 0)),
+    other_income: sum(e.filter((x) => x.kind === 'income').map((x) => x.amount)),
+    expenses: sum(e.filter((x) => x.kind === 'expense').map((x) => -x.amount)),
+    payments: sum(e.filter((x) => x.kind === 'payment').map((x) => -x.amount)),
+  };
+  const net_total = round2(
+    totals.settlement_income - totals.settlement_debits + totals.other_income - totals.expenses - totals.payments,
+  );
+  return { month, net_total, ...totals, settlements: s, entries: e };
+}
+
 const settlementDetails = (ctx, id) =>
   erpGet(`/virtual-inspect/owner-settlement/${id}?user_id=${encodeURIComponent(ctx.ownerId)}`).then(compact);
 
@@ -134,32 +177,26 @@ export async function executeTool(ctx, name, args, queries) {
           .sort()
           .slice(0, 6);
         if (!months.length) return { error: 'Give at least one month as YYYY-MM.' };
-        const list = await listSettlements(ctx, monthRange(months[0]).from, monthRange(months.at(-1)).to);
+        const from = monthRange(months[0]).from;
+        const to = monthRange(months.at(-1)).to;
+        const [list, entries] = await Promise.all([listSettlements(ctx, from, to), listManualEntries(ctx, from, to)]);
         return {
-          months: months.map((m) => {
-            const inMonth = list.filter((x) => String(x.date).startsWith(m));
-            return {
-              month: m,
-              settlement_income: round2(inMonth.filter((x) => x.owner_payout > 0).reduce((a, x) => a + x.owner_payout, 0)),
-              settlement_debits: round2(inMonth.filter((x) => x.owner_payout < 0).reduce((a, x) => a - x.owner_payout, 0)),
-              settlements: inMonth,
-            };
-          }),
-          note: 'Income = settlement payouts exactly as in Owner Financials, by settlement date.',
+          months: months.map((m) => monthTotals(m, list, entries)),
+          note: 'Same as the Owner Financials ledger: net_total = settlement payouts + other income − expenses − payments.',
         };
       }
 
       case 'get_month_breakdown': {
         if (!month) return { error: 'Give the month as YYYY-MM.' };
         const range = monthRange(month);
-        const list = await listSettlements(ctx, range.from, range.to);
+        const [list, entries] = await Promise.all([
+          listSettlements(ctx, range.from, range.to),
+          listManualEntries(ctx, range.from, range.to),
+        ]);
         // One tool call for the model; the details are fetched here in parallel.
         const details = await Promise.all(list.map((s) => settlementDetails(ctx, s.settlement_id).catch(() => ({ error: 'details unavailable' }))));
-        return {
-          month,
-          settlement_income: round2(list.filter((s) => s.owner_payout > 0).reduce((a, s) => a + s.owner_payout, 0)),
-          settlements: list.map((s, i) => ({ ...s, details: details[i] })),
-        };
+        const totals = monthTotals(month, list, entries);
+        return { ...totals, settlements: totals.settlements.map((s) => ({ ...s, details: details[list.indexOf(s)] })) };
       }
 
       case 'get_settlements': {
